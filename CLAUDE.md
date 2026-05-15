@@ -40,7 +40,7 @@ donulya-router/
 
 1. **amoCRM:**
    - Custom fields на сделке (`cf_router_assignment_id`, `cf_was_revived`, `cf_router_attempts`)
-   - Custom fields на пользователе (`cf_user_zone`, `cf_user_active_count`)
+   - Custom field на пользователе (`cf_user_zone`) — `cf_user_active_count` НЕ нужен, лимит активных отменён (см. SPEC §11.I)
    - Группы пользователей: «Клоузеры» / «Охотники» / «ОС» / «РОПы»
    - Webhook на `lead.status_changed` на наш endpoint
    - Точные pipeline_id и stage_id (см. SPEC §11.K)
