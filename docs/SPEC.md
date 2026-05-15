@@ -955,6 +955,136 @@ AI остаётся как **корректирующий слой** (см. ни
 - Поле сделки `status` или этап = «оплачен трипваер» — для конверсии
 - Возможность фильтровать `WHERE assigned_to=X AND created_at BETWEEN now-7d AND now` через `/api/v4/leads`
 
+### P. Защита от «фейк-така» (открыл карточку, не позвонил) ✅ ЗАКРЫТО 2026-05-15
+
+**Контекст:** после фикса §11.C (клик на 🔥 pill больше не сбрасывает таймер) встал вопрос — что делать если клоузер **открыл карточку** (видел задачу, был активен), но **не позвонил** за 5 минут. Это **отличается от пассивного таймаута** (не реагировал вовсе): здесь клоузер сознательно взаимодействовал с лидом и проигнорировал.
+
+**Детекция фейк-така:**
+
+У роутера есть оба сигнала:
+- `lead_pill_clicked(user_id, lead_id, ts)` — клоузер кликнул на pill, открыл карточку (логируется в `routing_decisions` или отдельной таблице `pill_click_events`)
+- `sipuni_call_initiated(user_id, lead_id, ts)` — клоузер начал звонить (Sipuni webhook)
+
+Фейк-так = `pill_clicked` есть, `sipuni_call_initiated` нет, таймер истёк (`Assignment.status = TIMEOUT`).
+
+**Реакция в 3 уровня (гибрид):**
+
+#### Уровень 1 — Real-time алерт РОПу
+
+Worker (тот же что обрабатывает TIMEOUT) проверяет: был ли клик на pill за время action window? Если да + не было Sipuni-звонка → через **30 секунд** после таймаута отправить пинг РОПу в Telegram:
+
+```
+⚠ Фейк-так
+Клоузер: Аня Иванова
+Лид: Иванов А. (#12345)
+Открыла карточку в 14:23:45, не позвонила за 5 мин.
+Лид передан Боре. Возможно, отвлеклась — проверь.
+[Открыть карточку] [Не реагировать]
+```
+
+30 сек задержка — чтобы дать клоузеру шанс «опаздать» с набором (например, набирал в момент таймаута, Sipuni запоздал).
+
+#### Уровень 2 — Накопительный счётчик в светофоре
+
+В `user_pipeline_state` добавляется поле `fake_take_count_24h INT DEFAULT 0`.
+
+Каждое подтверждённое событие фейк-така инкрементирует счётчик. Сброс — ежедневно в 09:00 (`UPDATE user_pipeline_state SET fake_take_count_24h = 0`).
+
+**При значении ≥ 3 за день:** клоузер автоматически понижается на ступень светофора:
+
+| Текущая зона | После 3-го фейк-така |
+|---|---|
+| 🟢 → 🟡 | поток норма, флаг РОПу |
+| 🟡 → 🟠 | поток −50% |
+| 🟠 → 🔴 | 0 новых лидов (полная блокировка пула) |
+| 🔴 → 🔴 | без изменений (уже исключён) |
+
+Понижение действует **до конца дня** (сброс в 09:00 следующего рабочего). Это даёт клоузеру немедленный фидбек: «3 фейк-така = потерял поток до завтра».
+
+#### Уровень 3 — Прозрачность для клоузера в виджете
+
+В виджете шапки (по соседству с raskladka / эффектом) появляется warning:
+
+```
+⏰ 22% сделок просрочено   8🔴/2🟠/3🟡/24🟢   ⚠ Поток −50%   ⚠ 2 фейк-така сегодня
+```
+
+При значении ≥ 1 показывается warning-pill (жёлтый при 1-2, красный при 3+). Tooltip: «Открывал карточку, не позвонил. Ещё N — поток режется».
+
+Это **превентивный сигнал**: клоузер сразу видит счётчик → понимает что 2 уже накопил → следующий пропуск дорого обойдётся. Не post-hoc удар.
+
+**Реализация:**
+
+```python
+async def on_timeout(assignment: Assignment):
+    # ... обычная логика реассайнмента ...
+    create_new_assignment_for_lead(assignment.lead_id, exclude_user=assignment.user_id)
+
+    # Проверяем был ли фейк-так
+    click = await db.fetch_one(
+        "SELECT 1 FROM pill_click_events WHERE user_id=? AND lead_id=? AND ts BETWEEN ? AND ?",
+        assignment.user_id, assignment.lead_id, assignment.assigned_at, assignment.expires_at
+    )
+    if click:
+        # Через 30 сек шлём алерт РОПу + инкрементируем счётчик
+        asyncio.create_task(handle_fake_take(assignment, delay=30))
+
+async def handle_fake_take(assignment: Assignment, delay: int = 30):
+    await asyncio.sleep(delay)
+    # Возможно за эти 30 сек клоузер всё-таки набрал? Перепроверим.
+    late_call = await db.fetch_one(
+        "SELECT 1 FROM sipuni_events WHERE user_id=? AND lead_id=? AND ts > ? AND event='call_initiated'",
+        assignment.user_id, assignment.lead_id, assignment.expires_at
+    )
+    if late_call:
+        return  # Не считаем фейк-таком если набрал хоть и поздно
+
+    # Уровень 1: пинг РОПу
+    await notify_rop_telegram(f"⚠ Фейк-так: {assignment.user.full_name} ...")
+
+    # Уровень 2: инкремент счётчика
+    state = await db.fetch_one("SELECT fake_take_count_24h, zone FROM user_pipeline_state WHERE user_id=?", assignment.user_id)
+    new_count = state.fake_take_count_24h + 1
+    await db.execute("UPDATE user_pipeline_state SET fake_take_count_24h=? WHERE user_id=?", new_count, assignment.user_id)
+
+    if new_count >= 3:
+        new_zone = downgrade_zone(state.zone)
+        await db.execute("UPDATE user_pipeline_state SET zone=? WHERE user_id=?", new_zone, assignment.user_id)
+```
+
+**Что НЕ делаем (зафиксировано):**
+- ❌ Жёсткая блокировка после 1 фейк-така (риск ложных срабатываний при случайных пропусках)
+- ❌ Денежный штраф (противоречит decisions «AI = аналитика для РОПа, не gate для клоузера»)
+- ❌ Игнорировать вообще (что было ранее) — даёт пространство для накопления плохих привычек
+
+**Что нужно добавить в схему БД:**
+
+```sql
+-- Лог кликов на 🔥 pill (для детекции фейк-така)
+CREATE TABLE pill_click_events (
+  id          BIGSERIAL PRIMARY KEY,
+  user_id     INTEGER REFERENCES users(id),
+  lead_id     BIGINT,
+  assignment_id BIGINT REFERENCES assignments(id),
+  ts          TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX pill_clicks_assignment_idx ON pill_click_events(assignment_id);
+
+-- В user_pipeline_state добавить:
+ALTER TABLE user_pipeline_state ADD COLUMN fake_take_count_24h INTEGER DEFAULT 0;
+ALTER TABLE user_pipeline_state ADD COLUMN fake_take_zone_override TEXT;  -- зона до понижения, чтобы откатить в 09:00
+```
+
+**Endpoint от виджета** (клиент-side событие):
+
+```
+POST /api/v1/widget/pill-click
+Body: { assignment_id: 123 }
+→ создаёт запись в pill_click_events
+```
+
+---
+
 ### O. Сопровождение — детали ✅ УТОЧНЕНО 2026-05-14
 
 **Триггер:** задача «Передать в сопровождение» в этапе «Полная продажа» (МПП2). Эта задача автоматически переводит сделку в воронку «Сбор документов» / этап «Поступил в ОС».
